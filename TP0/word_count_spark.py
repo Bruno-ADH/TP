@@ -7,11 +7,19 @@ Usage:
     python word_count_spark.py gutenberg_data/ --top 30
 """
 
+import os
 import re
-import sys
+import glob
 import argparse
 import time
+
 from pyspark import SparkContext, SparkConf
+
+
+def read_file(filepath: str) -> list[str]:
+    """Lit un fichier texte et retourne ses lignes. Exécuté par chaque worker Spark."""
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        return f.readlines()
 
 
 def main():
@@ -20,31 +28,42 @@ def main():
     parser.add_argument("--top", type=int, default=20, help="Nombre de mots à afficher (défaut : 20)")
     args = parser.parse_args()
 
+    # ── Collecte des fichiers ─────────────────────────────────────────────────
+    if args.path.endswith(".txt"):
+        files = [os.path.abspath(args.path)]
+    else:
+        files = glob.glob(os.path.join(args.path, "**", "*.txt"), recursive=True)
+
+    if not files:
+        print(f"[ERREUR] Aucun fichier .txt trouvé dans : {args.path}")
+        return
+
     # ── Initialisation Spark ──────────────────────────────────────────────────
     conf = (
         SparkConf()
         .setAppName("TP0_WordCount_Gutenberg")
-        .setMaster("local[*]")           # local[*] = utilise tous les cœurs du CPU
+        .setMaster("local[*]")
         .set("spark.driver.memory", "2g")
     )
     sc = SparkContext(conf=conf)
-    sc.setLogLevel("ERROR")             # masque les logs verbeux de Spark
+    sc.setLogLevel("ERROR")
 
     print(f"\n{'='*55}")
     print(f"  TP0 - Word Count MapReduce (PySpark)")
-    print(f"  Fichiers : {args.path}")
+    java_ver = os.popen("java -version 2>&1").read().split()[2].strip('"')
+    print(f"  {len(files)} fichier(s) | Java {java_ver}")
     print(f"{'='*55}\n")
 
     t0 = time.time()
 
-    # ── Lecture ───────────────────────────────────────────────────────────────
-    # sc.textFile() retourne un RDD où chaque élément = une ligne du fichier.
-    # Le chemin peut contenir des wildcards : "data/*.txt"
-    path = args.path.rstrip("/\\") + "/*" if not args.path.endswith(".txt") else args.path
-    lines = sc.textFile(path)
+    # ── Lecture parallèle des fichiers ────────────────────────────────────────
+    # On parallélise la liste des chemins, puis chaque worker lit son fichier.
+    # Cela évite d'utiliser le filesystem Hadoop (incompatible Java 21+).
+    file_rdd = sc.parallelize(files, numSlices=len(files))
+    lines = file_rdd.flatMap(read_file)
 
     # ── PHASE MAP ─────────────────────────────────────────────────────────────
-    # flatMap : pour chaque ligne, on émet autant de paires (mot, 1) qu'il y a de mots.
+    # Pour chaque ligne, on émet une paire (mot, 1) par mot trouvé.
     # "le chat le" → [("le", 1), ("chat", 1), ("le", 1)]
     word_pairs = lines.flatMap(
         lambda line: [
@@ -54,18 +73,16 @@ def main():
     )
 
     # ── PHASE SHUFFLE / SORT + REDUCE ─────────────────────────────────────────
-    # reduceByKey regroupe par clé (le mot) et applique la fonction d'agrégation.
-    # Spark fait automatiquement une pré-agrégation locale (= combiner)
-    # AVANT de transférer les données sur le réseau → très efficace.
-    word_counts = word_pairs.reduceByKey(lambda count_a, count_b: count_a + count_b)
+    # reduceByKey regroupe par clé (le mot) et additionne les occurrences.
+    # Spark pré-agrège localement avant le transfert réseau (= combiner).
+    word_counts = word_pairs.reduceByKey(lambda a, b: a + b)
 
-    # ── TRI et collecte ───────────────────────────────────────────────────────
-    # sortBy retourne un RDD trié. takeOrdered prend les N plus grands sans tout charger.
+    # ── TRI et collecte du top-N ──────────────────────────────────────────────
     top_n = word_counts.takeOrdered(args.top, key=lambda x: -x[1])
 
     t1 = time.time()
 
-    # ── Affichage ─────────────────────────────────────────────────────────────
+    # ── Stats et affichage ────────────────────────────────────────────────────
     total_words = word_pairs.count()
     distinct_words = word_counts.count()
 
@@ -79,12 +96,13 @@ def main():
         print(f"{rank:<6} {word:<25} {count:>12,}")
 
     # ── Export CSV ────────────────────────────────────────────────────────────
-    out_path = "word_counts_result"
-    # saveAsTextFile écrit en parallèle (un fichier par partition)
-    word_counts.sortBy(lambda x: -x[1]).map(
-        lambda x: f"{x[0]},{x[1]}"
-    ).saveAsTextFile(out_path)
-    print(f"\nRésultats complets sauvegardés dans : {out_path}/")
+    out_path = os.path.join(os.path.dirname(os.path.abspath(args.path)) if os.path.isfile(args.path) else os.path.abspath(args.path), "word_counts.csv")
+    all_counts = word_counts.sortBy(lambda x: -x[1]).collect()
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("mot,occurrences\n")
+        for word, count in all_counts:
+            f.write(f"{word},{count}\n")
+    print(f"\nRésultats complets sauvegardés dans : {out_path}")
 
     sc.stop()
 

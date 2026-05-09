@@ -13,7 +13,7 @@ env/
 *.egg-info/
 dist/
 build/
-
+.*
 # Spark
 derby.log
 metastore_db/
